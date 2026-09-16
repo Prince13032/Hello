@@ -12,6 +12,10 @@ var WS_UPSTREAM_HOST = "api.anthropic.com";
 // Narrow to ["/v1/code/agent-proxy/"] for minimum surface.
 var WS_PATH_PREFIXES = ["/v1/code/"];
 
+// SSE keep-alive: send a comment line every 5s of silence.
+var KEEPALIVE_MS = 5e3;
+var KEEPALIVE_BYTES = new TextEncoder().encode(": keep-alive\n\n");
+
 var CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -149,19 +153,27 @@ var worker_default = {
     Object.entries(CORS_HEADERS).forEach(([k, v]) => headers.set(k, v));
     if (isStreaming && response.body) {
       const { readable, writable } = new TransformStream({
+        lastData: Date.now(),
         transform(chunk, controller) {
+          this.lastData = Date.now();
           controller.enqueue(chunk);
         },
-        // Send keep-alive comment every 15s of silence to prevent proxy timeout
+        // Send keep-alive comment every 5s of silence to prevent proxy timeout
         start(controller) {
-          let lastData = Date.now();
-          const interval = setInterval(() => {
-            if (Date.now() - lastData > 14e3) {
-              controller.enqueue(new TextEncoder().encode(": keep-alive\n\n"));
-              lastData = Date.now();
+          this._interval = setInterval(() => {
+            if (Date.now() - this.lastData >= KEEPALIVE_MS) {
+              try {
+                controller.enqueue(KEEPALIVE_BYTES);
+              } catch (_) {
+                clearInterval(this._interval);
+                return;
+              }
+              this.lastData = Date.now();
             }
-          }, 5e3);
-          this._interval = interval;
+          }, KEEPALIVE_MS);
+        },
+        flush() {
+          if (this._interval) clearInterval(this._interval);
         },
         cancel() {
           if (this._interval) clearInterval(this._interval);
